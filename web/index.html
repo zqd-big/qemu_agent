@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QEMU Device Model Generator MVP</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="panel hero">
+      <h1>AI 生成 QEMU 外设仿真 C 代码 (MVP)</h1>
+      <p>上传驱动源码 zip + 参考 QEMU 仿真源码 zip，先生成澄清问题，再流式生成单个 <code>&lt;device_name&gt;.c</code>。</p>
+    </section>
+
+    <section class="panel grid-2">
+      <div>
+        <h2>1. 创建项目</h2>
+        <form id="createProjectForm">
+          <label>外设名称 <input id="deviceName" required placeholder="foo_uart"></label>
+          <label>外设类型
+            <select id="deviceType">
+              <option value="uart">uart</option>
+              <option value="spi">spi</option>
+              <option value="i2c">i2c</option>
+              <option value="eth">eth</option>
+              <option value="nandc">nandc</option>
+              <option value="other">other</option>
+            </select>
+          </label>
+          <button type="submit">创建 Project</button>
+        </form>
+      </div>
+      <div>
+        <h2>项目列表</h2>
+        <div class="row">
+          <button id="refreshProjectsBtn" type="button">刷新</button>
+          <select id="projectSelect" class="grow"></select>
+          <button id="loadProjectBtn" type="button">载入</button>
+        </div>
+        <pre id="projectMeta" class="mini"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>2. 上传源码 zip</h2>
+      <form id="uploadForm">
+        <div class="grid-2">
+          <label>驱动代码 zip
+            <input id="driverArchive" type="file" accept=".zip" required>
+          </label>
+          <label>参考 QEMU 仿真代码 zip
+            <input id="referenceArchive" type="file" accept=".zip" required>
+          </label>
+        </div>
+        <label>备注（可选） <input id="uploadNote" placeholder="如：Linux 驱动 + 同平台 SPI 控制器 QEMU 模型"></label>
+        <button type="submit">上传并解压</button>
+      </form>
+      <pre id="uploadResult" class="mini"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>3. Analyse + Questions</h2>
+      <div class="row">
+        <button id="analyseBtn" type="button">运行 Analyse</button>
+        <button id="loadQuestionsBtn" type="button">读取 Questions</button>
+      </div>
+      <pre id="analyseSummary" class="mini"></pre>
+      <div id="questionsContainer" class="questions"></div>
+      <div class="row">
+        <button id="saveAnswersBtn" type="button">保存 Answers</button>
+      </div>
+      <pre id="answersSaveResult" class="mini"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>4. Generate <code>.c</code>（流式）</h2>
+      <div class="grid-3">
+        <label>LLM 配置路径
+          <input id="llmConfigPath" value="config/llm.json">
+        </label>
+        <label>Top-K Chunks
+          <input id="topK" type="number" min="1" max="50" value="12">
+        </label>
+        <label>Temperature
+          <input id="temperature" type="number" min="0" max="1.5" step="0.1" value="0.1">
+        </label>
+      </div>
+      <div class="grid-3">
+        <label>Max Tokens（空=用配置 transformer）
+          <input id="maxTokens" type="number" min="128" max="32768" placeholder="4096">
+        </label>
+        <label class="checkbox">
+          <input id="generateReport" type="checkbox" checked>
+          生成 report.md
+        </label>
+      </div>
+      <div class="row">
+        <button id="generateBtn" type="button">开始生成</button>
+      </div>
+      <div class="stream-wrap">
+        <pre id="streamOutput" class="stream"></pre>
+      </div>
+      <pre id="generateStatus" class="mini"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>Artifacts</h2>
+      <div id="artifactLinks" class="artifacts"></div>
+    </section>
+
+    <section class="panel">
+      <h2>日志</h2>
+      <pre id="logBox" class="mini"></pre>
+    </section>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
+
