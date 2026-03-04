@@ -15,8 +15,8 @@ from .analyse import run_analysis
 from .generator import build_generation_messages, build_report_markdown, sanitize_and_validate_c_output
 from .ingest import run_ingest
 from .llm_client import LLMConfigError, LLMRequestError, resolve_llm_target, stream_chat_completion
-from .models import AnalysisResponse, CreateProjectRequest, GenerateRequest, ProjectResponse, SaveAnswersRequest
-from .questions import generate_questions_from_analysis
+from .models import AnalyseRequest, AnalysisResponse, CreateProjectRequest, GenerateRequest, ProjectResponse, SaveAnswersRequest
+from .questions import generate_questions
 from .retrieval import select_top_chunks
 from .settings import DEFAULT_LLM_CONFIG_PATH, MAX_UPLOAD_MB, PROJECTS_DIR
 from .utils import ensure_dir, json_dump, json_load, safe_slug, sanitize_artifact_name, utc_now_iso
@@ -196,9 +196,13 @@ async def upload_archives(
 
 
 @router.post("/projects/{project_id}/analyse", response_model=AnalysisResponse)
-def analyse_project(project_id: str) -> AnalysisResponse:
+async def analyse_project(
+    project_id: str,
+    req: AnalyseRequest | None = Body(default=None),
+) -> AnalysisResponse:
     meta = _project_meta_or_404(project_id)
     root = _project_root(project_id)
+    request = req or AnalyseRequest()
     if _count_real_files(root / "uploads" / "driver") == 0:
         raise HTTPException(status_code=400, detail="Driver upload is empty. Upload driver archive first.")
     if _count_real_files(root / "uploads" / "reference") == 0:
@@ -208,13 +212,25 @@ def analyse_project(project_id: str) -> AnalysisResponse:
     try:
         ingest_out = run_ingest(root)
         analysis = run_analysis(root, meta["device_name"], meta["device_type"])
-        questions = generate_questions_from_analysis(analysis, root)
+        questions = await generate_questions(
+            analysis,
+            root,
+            llm_config_path=request.llm_config_path,
+            use_llm=request.use_llm_questions,
+            allow_heuristic_fallback=request.allow_heuristic_fallback,
+            top_k=request.question_top_k,
+            temperature=request.question_temperature,
+            max_tokens=request.question_max_tokens,
+        )
         db.update_project_status(project_id, "questions_ready")
         summary = {
             "files": ingest_out["ingest"]["file_count"],
             "chunks": ingest_out["ingest"]["chunks_count"],
             "candidate_registers": len(analysis.get("derived", {}).get("candidate_registers", [])),
             "questions": len(questions.get("questions", [])),
+            "questions_source": questions.get("source", "unknown"),
+            "questions_model": (questions.get("llm") or {}).get("model"),
+            "questions_fallback_reason": questions.get("fallback_reason"),
         }
         return AnalysisResponse(
             project_id=project_id,

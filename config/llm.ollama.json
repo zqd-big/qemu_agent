@@ -1,0 +1,20 @@
+{
+  "Providers": [
+    {
+      "name": "ollama",
+      "protocol": "ollama",
+      "api_base_url": "http://127.0.0.1:11434/api/chat",
+      "api_key": "",
+      "models": ["qwen2.5-coder:14b", "deepseek-r1:8b", "llama3.1:8b"],
+      "transformer": {
+        "use": [["maxtoken", { "max_tokens": 2048 }]]
+      }
+    }
+  ],
+  "Router": {
+    "default": "ollama,qwen2.5-coder:14b",
+    "HOST": "127.0.0.1",
+    "LOG": false
+  }
+}
+

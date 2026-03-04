@@ -171,8 +171,17 @@ async function uploadHandler(e) {
 
 async function analyseHandler() {
   requireProject();
+  const payload = {
+    llm_config_path: el("llmConfigPath").value.trim() || null,
+    use_llm_questions: true,
+    allow_heuristic_fallback: false,
+    question_top_k: 10,
+    question_temperature: 0.1,
+  };
   const res = await api(`/projects/${encodeURIComponent(state.currentProjectId)}/analyse`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
   el("analyseSummary").textContent = JSON.stringify(res, null, 2);
   log("analyse finished", res);
@@ -297,4 +306,3 @@ async function init() {
 }
 
 init();
-

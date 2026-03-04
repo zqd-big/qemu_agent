@@ -180,6 +180,28 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 当前 MVP 仅支持 `.zip`。
 
+### `POST /projects/{id}/analyse`
+
+默认会调用 LLM 生成问题（不是固定模板），并在失败时回退启发式问题。
+
+请求体（可选）：
+
+```json
+{
+  "llm_config_path": "config/llm.json",
+  "use_llm_questions": true,
+  "allow_heuristic_fallback": true,
+  "question_top_k": 10,
+  "question_temperature": 0.1,
+  "question_max_tokens": 2048
+}
+```
+
+`summary.questions_source` 会显示问题来源：
+
+- `llm-analysis`：成功走 LLM
+- `heuristic-fallback`：LLM 失败后回退
+
 ### `POST /projects/{id}/generate`（流式）
 
 请求体示例：

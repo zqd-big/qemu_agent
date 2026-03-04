@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from typing import Any
 
-from .utils import json_dump, utc_now_iso
+from .llm_client import LLMConfigError, LLMRequestError, resolve_llm_target, stream_chat_completion
+from .retrieval import select_top_chunks
+from .settings import DEFAULT_LLM_CONFIG_PATH
+from .utils import json_dump, strip_markdown_fence, utc_now_iso
+
+
+QUESTION_FORMATS = {"object", "string", "number", "array", "boolean"}
 
 
 def _q(qid: str, question: str, why: str, answer_format: str, examples: list[str] | None = None) -> dict[str, Any]:
@@ -16,7 +24,205 @@ def _q(qid: str, question: str, why: str, answer_format: str, examples: list[str
     }
 
 
+def _normalize_question_items(items: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen_questions: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "")).strip()
+        if not question or question in seen_questions:
+            continue
+        why = str(item.get("why", "")).strip() or "Clarify hardware semantics to reduce wrong QEMU assumptions."
+        answer_format = str(item.get("answer_format", "object")).strip().lower()
+        if answer_format not in QUESTION_FORMATS:
+            answer_format = "object"
+        raw_examples = item.get("examples")
+        examples: list[str]
+        if isinstance(raw_examples, list):
+            examples = [str(v) for v in raw_examples if str(v).strip()][:3]
+        else:
+            examples = []
+        out.append(
+            {
+                "question": question,
+                "why": why,
+                "answer_format": answer_format,
+                "examples": examples,
+            }
+        )
+        seen_questions.add(question)
+        if len(out) >= 20:
+            break
+    for idx, item in enumerate(out, start=1):
+        item["id"] = f"q{idx:02d}"
+    return out
+
+
+def _extract_json_payload(text: str) -> Any:
+    cleaned = strip_markdown_fence(text).strip()
+    if not cleaned:
+        raise ValueError("LLM returned empty questions payload")
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # extract biggest JSON object/array if wrapped by prose
+    obj_match = re.search(r"\{[\s\S]*\}", cleaned)
+    arr_match = re.search(r"\[[\s\S]*\]", cleaned)
+    candidates = [m.group(0) for m in (obj_match, arr_match) if m]
+    if not candidates:
+        raise ValueError("LLM questions output is not valid JSON")
+
+    candidates.sort(key=len, reverse=True)
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("Failed to parse JSON from LLM questions output")
+
+
+def _build_question_prompt(
+    analysis: dict[str, Any],
+    top_chunks: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    driver = analysis.get("driver", {})
+    ref = analysis.get("reference_qemu", {})
+    derived = analysis.get("derived", {})
+
+    driver_evidence = {
+        "register_defines": driver.get("register_defines", [])[:80],
+        "mmio_accesses": driver.get("mmio_accesses", [])[:120],
+        "polling_patterns": driver.get("polling_patterns", [])[:50],
+        "irq_clues": driver.get("irq_clues", [])[:50],
+        "dma_clues": driver.get("dma_clues", [])[:50],
+        "reset_default_clues": driver.get("reset_default_clues", [])[:50],
+    }
+    ref_evidence = {
+        "state_structs": ref.get("state_structs", [])[:30],
+        "memory_region_ops": ref.get("memory_region_ops", [])[:30],
+        "vmstate_descriptions": ref.get("vmstate_descriptions", [])[:30],
+        "irq_logic_clues": ref.get("irq_logic_clues", [])[:40],
+        "fifo_logic_clues": ref.get("fifo_logic_clues", [])[:40],
+        "read_write_callbacks": ref.get("read_write_callbacks", [])[:40],
+    }
+    chunk_payload = []
+    for chunk in top_chunks:
+        chunk_payload.append(
+            {
+                "id": chunk.get("id"),
+                "path": chunk.get("path"),
+                "bucket": chunk.get("bucket"),
+                "chunk_type": chunk.get("chunk_type"),
+                "start_line": chunk.get("start_line"),
+                "end_line": chunk.get("end_line"),
+                "score": chunk.get("retrieval_score"),
+                "text": str(chunk.get("text", ""))[:2500],
+            }
+        )
+
+    user_obj = {
+        "task": "generate_clarifying_questions_before_qemu_modeling",
+        "device_name": analysis.get("device_name"),
+        "device_type": analysis.get("device_type"),
+        "priority_topics": [
+            "W1C/W1S",
+            "read-clear",
+            "write-trigger",
+            "busy timing",
+            "FIFO depth/threshold",
+            "IRQ set/clear and mask interaction",
+            "polling timeout",
+            "DMA descriptor layout",
+        ],
+        "derived_summary": derived,
+        "driver_evidence": driver_evidence,
+        "reference_qemu_evidence": ref_evidence,
+        "retrieved_code_chunks": chunk_payload,
+        "output_schema": {
+            "questions": [
+                {
+                    "question": "string",
+                    "why": "string",
+                    "answer_format": "one of object|string|number|array|boolean",
+                    "examples": ["string", "string"],
+                }
+            ]
+        },
+    }
+
+    system = (
+        "You are a senior QEMU peripheral modeling reviewer.\n"
+        "Generate concrete clarifying questions based on provided driver/reference evidence.\n"
+        "Rules:\n"
+        "- Output STRICT JSON only. No markdown, no prose.\n"
+        "- Prefer 8 to 15 questions.\n"
+        "- Questions must reference observed registers/access patterns, not generic templates.\n"
+        "- Prioritize side-effect semantics: W1C/W1S, read-clear, write-trigger, busy timing, FIFO, IRQ, polling timeout, DMA descriptors.\n"
+        "- Keep each question one sentence and directly answerable.\n"
+        "- Use practical answer_format and examples.\n"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user_obj, ensure_ascii=False, indent=2)},
+    ]
+
+
+async def _generate_questions_via_llm(
+    *,
+    analysis: dict[str, Any],
+    project_root: Path,
+    llm_config_path: str | Path,
+    top_k: int,
+    temperature: float,
+    max_tokens: int | None,
+) -> dict[str, Any]:
+    target = resolve_llm_target(llm_config_path)
+    top_chunks = select_top_chunks(project_root, analysis, {}, top_k)
+    messages = _build_question_prompt(analysis, top_chunks)
+
+    parts: list[str] = []
+    async for token in stream_chat_completion(
+        target,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    ):
+        parts.append(token)
+    raw = "".join(parts)
+    parsed = _extract_json_payload(raw)
+
+    if isinstance(parsed, dict):
+        raw_items = parsed.get("questions", [])
+    elif isinstance(parsed, list):
+        raw_items = parsed
+    else:
+        raw_items = []
+
+    items = _normalize_question_items(raw_items if isinstance(raw_items, list) else [])
+    if len(items) < 6:
+        raise ValueError(f"LLM generated too few valid questions: {len(items)}")
+
+    return {
+        "version": "mvp-2",
+        "generated_at": utc_now_iso(),
+        "source": "llm-analysis",
+        "llm": {
+            "provider": target.provider_name,
+            "model": target.model_name,
+            "llm_config_path": str(llm_config_path),
+            "token_chars": len(raw),
+            "top_k_chunks": top_k,
+        },
+        "questions": items,
+    }
+
+
 def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Path) -> dict[str, Any]:
+    # heuristic fallback implementation
     derived = analysis.get("derived", {})
     driver = analysis.get("driver", {})
     device_name = analysis.get("device_name", "device")
@@ -138,7 +344,7 @@ def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Pat
         deduped.append(q)
 
     result = {
-        "version": "mvp-1",
+        "version": "mvp-2",
         "generated_at": utc_now_iso(),
         "source": "heuristic-analysis",
         "questions": deduped[:20],
@@ -146,4 +352,46 @@ def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Pat
 
     json_dump(project_root / "artifacts" / "questions.json", result)
     return result
+
+
+async def generate_questions(
+    analysis: dict[str, Any],
+    project_root: Path,
+    *,
+    llm_config_path: str | Path | None = None,
+    use_llm: bool = True,
+    allow_heuristic_fallback: bool = True,
+    top_k: int = 10,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    artifacts_path = project_root / "artifacts" / "questions.json"
+    resolved_config = str(llm_config_path or DEFAULT_LLM_CONFIG_PATH)
+
+    if use_llm:
+        try:
+            result = await _generate_questions_via_llm(
+                analysis=analysis,
+                project_root=project_root,
+                llm_config_path=resolved_config,
+                top_k=top_k,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            json_dump(artifacts_path, result)
+            return result
+        except (LLMConfigError, LLMRequestError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+            if not allow_heuristic_fallback:
+                raise RuntimeError(f"LLM question generation failed: {exc}") from exc
+            fallback = generate_questions_from_analysis(analysis, project_root)
+            fallback["source"] = "heuristic-fallback"
+            fallback["fallback_reason"] = str(exc)
+            fallback["llm_attempt"] = {
+                "llm_config_path": resolved_config,
+                "top_k_chunks": top_k,
+            }
+            json_dump(artifacts_path, fallback)
+            return fallback
+
+    return generate_questions_from_analysis(analysis, project_root)
 

@@ -35,3 +35,12 @@ class AnalysisResponse(BaseModel):
     questions_artifact: str
     summary: dict[str, Any]
 
+
+class AnalyseRequest(BaseModel):
+    llm_config_path: str | None = None
+    use_llm_questions: bool = True
+    allow_heuristic_fallback: bool = True
+    question_top_k: int = Field(default=10, ge=1, le=30)
+    question_temperature: float = Field(default=0.1, ge=0.0, le=1.5)
+    question_max_tokens: int | None = Field(default=None, ge=128, le=8192)
+

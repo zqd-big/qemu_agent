@@ -20,6 +20,7 @@ class LLMRequestError(RuntimeError):
 @dataclass
 class ProviderSpec:
     name: str
+    protocol: str
     api_base_url: str
     api_key: str
     models: list[str]
@@ -29,6 +30,7 @@ class ProviderSpec:
 @dataclass
 class ResolvedLLMTarget:
     provider_name: str
+    protocol: str
     model_name: str
     api_base_url: str
     api_key: str
@@ -54,9 +56,12 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _parse_provider(entry: dict[str, Any]) -> ProviderSpec:
     if not isinstance(entry, dict):
         raise LLMConfigError("Provider entry must be an object")
-    for key in ("name", "api_base_url", "api_key", "models"):
+    for key in ("name", "api_base_url", "models"):
         if key not in entry:
             raise LLMConfigError(f"Provider missing required field: {key}")
+    protocol = str(entry.get("protocol", "openai")).strip().lower()
+    if protocol not in {"openai", "ollama"}:
+        raise LLMConfigError(f"Unsupported provider protocol '{protocol}'. Expected 'openai' or 'ollama'.")
     models = entry["models"]
     if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
         raise LLMConfigError("Provider.models must be a string array")
@@ -69,10 +74,11 @@ def _parse_provider(entry: dict[str, Any]) -> ProviderSpec:
     name = str(entry["name"])
     env_key = f"{name.upper()}_API_KEY"
     api_key = os.getenv(env_key) or str(entry.get("api_key", "")).strip()
-    if not api_key:
+    if protocol == "openai" and not api_key:
         raise LLMConfigError(f"Provider '{name}' has empty api_key and env override {env_key} is not set")
     return ProviderSpec(
         name=name,
+        protocol=protocol,
         api_base_url=str(entry["api_base_url"]).strip(),
         api_key=api_key,
         models=[str(m) for m in models],
@@ -103,6 +109,7 @@ def resolve_llm_target(config_path: str | Path) -> ResolvedLLMTarget:
         raise LLMConfigError(f"Provider api_base_url must be http(s): {provider.api_base_url}")
     return ResolvedLLMTarget(
         provider_name=provider.name,
+        protocol=provider.protocol,
         model_name=model_name,
         api_base_url=provider.api_base_url,
         api_key=provider.api_key,
@@ -110,7 +117,9 @@ def resolve_llm_target(config_path: str | Path) -> ResolvedLLMTarget:
     )
 
 
-def _apply_transformers(payload: dict[str, Any], transformer_use: list[Any]) -> None:
+def _resolve_max_tokens(transformer_use: list[Any], requested_max_tokens: int | None) -> int | None:
+    if requested_max_tokens is not None:
+        return requested_max_tokens
     for item in transformer_use:
         if not (isinstance(item, list) and len(item) == 2):
             continue
@@ -118,9 +127,9 @@ def _apply_transformers(payload: dict[str, Any], transformer_use: list[Any]) -> 
         if name == "maxtoken":
             if isinstance(params, dict):
                 max_tokens = params.get("max_tokens")
-                if isinstance(max_tokens, int) and max_tokens > 0 and "max_tokens" not in payload:
-                    payload["max_tokens"] = max_tokens
-        # Reserved for future transformers.
+                if isinstance(max_tokens, int) and max_tokens > 0:
+                    return max_tokens
+    return None
 
 
 def build_chat_payload(
@@ -131,15 +140,28 @@ def build_chat_payload(
     max_tokens: int | None = None,
     stream: bool = True,
 ) -> dict[str, Any]:
+    resolved_max_tokens = _resolve_max_tokens(target.transformer_use, max_tokens)
+    if target.protocol == "ollama":
+        payload = {
+            "model": target.model_name,
+            "messages": messages,
+            "stream": stream,
+            "options": {
+                "temperature": temperature,
+            },
+        }
+        if resolved_max_tokens is not None:
+            payload["options"]["num_predict"] = resolved_max_tokens
+        return payload
+
     payload: dict[str, Any] = {
         "model": target.model_name,
         "messages": messages,
         "temperature": temperature,
         "stream": stream,
     }
-    _apply_transformers(payload, target.transformer_use)
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+    if resolved_max_tokens is not None:
+        payload["max_tokens"] = resolved_max_tokens
     return payload
 
 
@@ -164,6 +186,16 @@ async def stream_chat_completion(
     temperature: float = 0.1,
     max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
+    if target.protocol == "ollama":
+        async for chunk in _stream_ollama_chat_completion(
+            target,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            yield chunk
+        return
+
     payload = build_chat_payload(
         target,
         messages,
@@ -171,10 +203,9 @@ async def stream_chat_completion(
         max_tokens=max_tokens,
         stream=True,
     )
-    headers = {
-        "Authorization": f"Bearer {target.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if target.api_key:
+        headers["Authorization"] = f"Bearer {target.api_key}"
     timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -216,10 +247,13 @@ async def stream_chat_completion(
                                 content = _extract_delta_content(delta)
                                 if content:
                                     yield content
-                            # Some providers may return non-stream-like chunks.
+                                continue
+                            # Fallback for providers that return message chunks without delta.
                             msg = choice0.get("message") if isinstance(choice0.get("message"), dict) else None
                             if msg:
-                                content = _extract_delta_content(msg) or (msg.get("content") if isinstance(msg.get("content"), str) else "")
+                                content = _extract_delta_content(msg) or (
+                                    msg.get("content") if isinstance(msg.get("content"), str) else ""
+                                )
                                 if content:
                                     yield content
                     elif not saw_data_line and line.startswith("{"):
@@ -237,4 +271,72 @@ async def stream_chat_completion(
                         break
         except httpx.HTTPError as exc:
             raise LLMRequestError(f"LLM request failed: {exc}") from exc
+
+
+def _extract_ollama_content(evt: dict[str, Any]) -> str:
+    msg = evt.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+    # compatibility with /api/generate response style
+    response = evt.get("response")
+    if isinstance(response, str):
+        return response
+    return ""
+
+
+async def _stream_ollama_chat_completion(
+    target: ResolvedLLMTarget,
+    messages: list[dict[str, Any]],
+    *,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    payload = build_chat_payload(
+        target,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+    )
+    headers = {"Content-Type": "application/json"}
+    if target.api_key:
+        headers["Authorization"] = f"Bearer {target.api_key}"
+    timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            async with client.stream(
+                "POST",
+                target.api_base_url,
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    snippet = body.decode("utf-8", errors="replace")[:500]
+                    raise LLMRequestError(f"Ollama HTTP {resp.status_code}: {snippet}")
+
+                async for line in resp.aiter_lines():
+                    if line is None:
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                        if line == "[DONE]":
+                            break
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    content = _extract_ollama_content(evt)
+                    if content:
+                        yield content
+                    if evt.get("done") is True:
+                        break
+        except httpx.HTTPError as exc:
+            raise LLMRequestError(f"Ollama request failed: {exc}") from exc
 
