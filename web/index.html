@@ -65,6 +65,11 @@
         <button id="analyseBtn" type="button">运行 Analyse</button>
         <button id="loadQuestionsBtn" type="button">读取 Questions</button>
       </div>
+      <div class="analyse-progress-wrap">
+        <progress id="analyseProgress" max="100" value="0"></progress>
+        <div id="analyseProgressText" class="progress-text">Idle</div>
+      </div>
+      <pre id="analyseLive" class="mini"></pre>
       <pre id="analyseSummary" class="mini"></pre>
       <div id="questionsContainer" class="questions"></div>
       <div class="row">

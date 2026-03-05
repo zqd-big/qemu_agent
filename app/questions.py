@@ -24,7 +24,47 @@ def _q(qid: str, question: str, why: str, answer_format: str, examples: list[str
     }
 
 
-def _normalize_question_items(items: list[Any]) -> list[dict[str, Any]]:
+def _estimate_question_budget(analysis: dict[str, Any]) -> dict[str, int]:
+    derived = analysis.get("derived", {})
+    driver = analysis.get("driver", {})
+    ref = analysis.get("reference_qemu", {})
+    device_type = str(analysis.get("device_type", "")).lower()
+
+    regs = len(derived.get("candidate_registers", []))
+    mmio = int(derived.get("driver_mmio_access_count", 0))
+    polling = int(derived.get("driver_polling_pattern_count", 0))
+    irq = len(derived.get("likely_irq_regs", [])) + len(driver.get("irq_clues", []))
+    fifo = len(derived.get("likely_fifo_regs", [])) + len(ref.get("fifo_logic_clues", []))
+    dma = len(derived.get("likely_dma_regs", [])) + len(driver.get("dma_clues", []))
+
+    complexity = 0
+    if regs >= 8:
+        complexity += 1
+    if regs >= 20:
+        complexity += 1
+    if mmio >= 20:
+        complexity += 1
+    if mmio >= 80:
+        complexity += 1
+    if polling > 0:
+        complexity += 1
+    if irq > 0:
+        complexity += 1
+    if fifo > 0:
+        complexity += 1
+    if dma > 0:
+        complexity += 1
+    if device_type in {"eth", "nandc"}:
+        complexity += 1
+
+    target = 6 + min(9, complexity)
+    target = max(6, min(16, target))
+    min_count = max(5, target - 3)
+    max_count = min(18, target + 3)
+    return {"target": target, "min": min_count, "max": max_count}
+
+
+def _normalize_question_items(items: list[Any], *, max_items: int = 20) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen_questions: set[str] = set()
     for item in items:
@@ -43,16 +83,25 @@ def _normalize_question_items(items: list[Any]) -> list[dict[str, Any]]:
             examples = [str(v) for v in raw_examples if str(v).strip()][:3]
         else:
             examples = []
+        raw_refs = item.get("evidence_refs")
+        evidence_refs: list[str] = []
+        if isinstance(raw_refs, list):
+            evidence_refs = [str(v).strip() for v in raw_refs if str(v).strip()][:4]
+        elif isinstance(raw_refs, str) and raw_refs.strip():
+            evidence_refs = [raw_refs.strip()]
+        if not evidence_refs:
+            evidence_refs = ["missing-evidence"]
         out.append(
             {
                 "question": question,
                 "why": why,
                 "answer_format": answer_format,
                 "examples": examples,
+                "evidence_refs": evidence_refs,
             }
         )
         seen_questions.add(question)
-        if len(out) >= 20:
+        if len(out) >= max_items:
             break
     for idx, item in enumerate(out, start=1):
         item["id"] = f"q{idx:02d}"
@@ -88,26 +137,37 @@ def _extract_json_payload(text: str) -> Any:
 def _build_question_prompt(
     analysis: dict[str, Any],
     top_chunks: list[dict[str, Any]],
+    budget: dict[str, int],
+    *,
+    compact: bool = False,
+    use_no_think: bool = False,
 ) -> list[dict[str, str]]:
     driver = analysis.get("driver", {})
     ref = analysis.get("reference_qemu", {})
     derived = analysis.get("derived", {})
 
+    reg_cap = 36 if compact else 80
+    mmio_cap = 60 if compact else 120
+    clue_cap = 24 if compact else 50
+    ref_cap = 18 if compact else 30
+    callback_cap = 24 if compact else 40
+    chunk_text_cap = 1200 if compact else 2500
+
     driver_evidence = {
-        "register_defines": driver.get("register_defines", [])[:80],
-        "mmio_accesses": driver.get("mmio_accesses", [])[:120],
-        "polling_patterns": driver.get("polling_patterns", [])[:50],
-        "irq_clues": driver.get("irq_clues", [])[:50],
-        "dma_clues": driver.get("dma_clues", [])[:50],
-        "reset_default_clues": driver.get("reset_default_clues", [])[:50],
+        "register_defines": driver.get("register_defines", [])[:reg_cap],
+        "mmio_accesses": driver.get("mmio_accesses", [])[:mmio_cap],
+        "polling_patterns": driver.get("polling_patterns", [])[:clue_cap],
+        "irq_clues": driver.get("irq_clues", [])[:clue_cap],
+        "dma_clues": driver.get("dma_clues", [])[:clue_cap],
+        "reset_default_clues": driver.get("reset_default_clues", [])[:clue_cap],
     }
     ref_evidence = {
-        "state_structs": ref.get("state_structs", [])[:30],
-        "memory_region_ops": ref.get("memory_region_ops", [])[:30],
-        "vmstate_descriptions": ref.get("vmstate_descriptions", [])[:30],
-        "irq_logic_clues": ref.get("irq_logic_clues", [])[:40],
-        "fifo_logic_clues": ref.get("fifo_logic_clues", [])[:40],
-        "read_write_callbacks": ref.get("read_write_callbacks", [])[:40],
+        "state_structs": ref.get("state_structs", [])[:ref_cap],
+        "memory_region_ops": ref.get("memory_region_ops", [])[:ref_cap],
+        "vmstate_descriptions": ref.get("vmstate_descriptions", [])[:ref_cap],
+        "irq_logic_clues": ref.get("irq_logic_clues", [])[:callback_cap],
+        "fifo_logic_clues": ref.get("fifo_logic_clues", [])[:callback_cap],
+        "read_write_callbacks": ref.get("read_write_callbacks", [])[:callback_cap],
     }
     chunk_payload = []
     for chunk in top_chunks:
@@ -120,7 +180,7 @@ def _build_question_prompt(
                 "start_line": chunk.get("start_line"),
                 "end_line": chunk.get("end_line"),
                 "score": chunk.get("retrieval_score"),
-                "text": str(chunk.get("text", ""))[:2500],
+                "text": str(chunk.get("text", ""))[:chunk_text_cap],
             }
         )
 
@@ -139,6 +199,7 @@ def _build_question_prompt(
             "DMA descriptor layout",
         ],
         "derived_summary": derived,
+        "question_budget": budget,
         "driver_evidence": driver_evidence,
         "reference_qemu_evidence": ref_evidence,
         "retrieved_code_chunks": chunk_payload,
@@ -149,6 +210,7 @@ def _build_question_prompt(
                     "why": "string",
                     "answer_format": "one of object|string|number|array|boolean",
                     "examples": ["string", "string"],
+                    "evidence_refs": ["path:line", "chunk-id"],
                 }
             ]
         },
@@ -159,15 +221,23 @@ def _build_question_prompt(
         "Generate concrete clarifying questions based on provided driver/reference evidence.\n"
         "Rules:\n"
         "- Output STRICT JSON only. No markdown, no prose.\n"
-        "- Prefer 8 to 15 questions.\n"
+        f"- Generate between {budget['min']} and {budget['max']} questions. Target is {budget['target']}.\n"
+        "- If evidence already strongly determines a behavior, avoid redundant questions.\n"
+        "- If evidence is missing, ask only high-value questions that unblock emulation behavior.\n"
         "- Questions must reference observed registers/access patterns, not generic templates.\n"
         "- Prioritize side-effect semantics: W1C/W1S, read-clear, write-trigger, busy timing, FIFO, IRQ, polling timeout, DMA descriptors.\n"
         "- Keep each question one sentence and directly answerable.\n"
+        "- Do NOT output thinking/reasoning trace. Output final JSON directly.\n"
+        "- Every question must include `evidence_refs` (path:line or chunk-id). Use ['missing-evidence'] if no direct reference exists.\n"
         "- Use practical answer_format and examples.\n"
     )
+    user_content = json.dumps(user_obj, ensure_ascii=False, indent=2)
+    if use_no_think:
+        # qwen thinking models on ollama support this directive.
+        user_content = "/no_think\n" + user_content
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": json.dumps(user_obj, ensure_ascii=False, indent=2)},
+        {"role": "user", "content": user_content},
     ]
 
 
@@ -181,8 +251,16 @@ async def _generate_questions_via_llm(
     max_tokens: int | None,
 ) -> dict[str, Any]:
     target = resolve_llm_target(llm_config_path)
-    top_chunks = select_top_chunks(project_root, analysis, {}, top_k)
-    messages = _build_question_prompt(analysis, top_chunks)
+    budget = _estimate_question_budget(analysis)
+    initial_top_chunks = select_top_chunks(project_root, analysis, {}, top_k)
+    use_no_think = target.protocol == "ollama" and target.model_name.lower().startswith("qwen3")
+    messages = _build_question_prompt(
+        analysis,
+        initial_top_chunks,
+        budget,
+        compact=False,
+        use_no_think=use_no_think,
+    )
 
     parts: list[str] = []
     async for token in stream_chat_completion(
@@ -190,10 +268,50 @@ async def _generate_questions_via_llm(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        response_format="json",
     ):
         parts.append(token)
     raw = "".join(parts)
-    parsed = _extract_json_payload(raw)
+    retry_used = False
+    retry_reason = None
+    try:
+        parsed = _extract_json_payload(raw)
+    except ValueError as first_exc:
+        retry_used = True
+        retry_reason = str(first_exc)
+        retry_top_k = max(4, min(top_k, top_k // 2 if top_k > 6 else top_k))
+        retry_top_chunks = select_top_chunks(project_root, analysis, {}, retry_top_k)
+        retry_messages = _build_question_prompt(
+            analysis,
+            retry_top_chunks,
+            budget,
+            compact=True,
+            use_no_think=True if target.protocol == "ollama" else use_no_think,
+        )
+        retry_max_tokens = max((max_tokens or 0), 4096) if target.protocol == "ollama" else max_tokens
+        retry_parts: list[str] = []
+        async for token in stream_chat_completion(
+            target,
+            retry_messages,
+            temperature=temperature,
+            max_tokens=retry_max_tokens,
+            response_format="json",
+        ):
+            retry_parts.append(token)
+        retry_raw = "".join(retry_parts)
+        try:
+            parsed = _extract_json_payload(retry_raw)
+            raw = retry_raw
+            initial_top_chunks = retry_top_chunks
+        except ValueError as second_exc:
+            if target.protocol == "ollama":
+                raise ValueError(
+                    "LLM returned empty questions payload after retry. "
+                    f"model={target.model_name}. "
+                    "This commonly happens on tiny thinking models when token budget is spent on reasoning. "
+                    "Try a stronger local model (e.g. qwen2.5-coder:14b), or increase question_max_tokens."
+                ) from second_exc
+            raise
 
     if isinstance(parsed, dict):
         raw_items = parsed.get("questions", [])
@@ -202,20 +320,24 @@ async def _generate_questions_via_llm(
     else:
         raw_items = []
 
-    items = _normalize_question_items(raw_items if isinstance(raw_items, list) else [])
-    if len(items) < 6:
-        raise ValueError(f"LLM generated too few valid questions: {len(items)}")
+    items = _normalize_question_items(raw_items if isinstance(raw_items, list) else [], max_items=budget["max"])
+    if len(items) < budget["min"]:
+        raise ValueError(f"LLM generated too few valid questions: {len(items)} < {budget['min']}")
+    items = items[: budget["max"]]
 
     return {
         "version": "mvp-2",
         "generated_at": utc_now_iso(),
         "source": "llm-analysis",
+        "question_budget": budget,
         "llm": {
             "provider": target.provider_name,
             "model": target.model_name,
             "llm_config_path": str(llm_config_path),
             "token_chars": len(raw),
-            "top_k_chunks": top_k,
+            "top_k_chunks": len(initial_top_chunks),
+            "retry_used": retry_used,
+            "retry_reason": retry_reason,
         },
         "questions": items,
     }
@@ -226,6 +348,7 @@ def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Pat
     derived = analysis.get("derived", {})
     driver = analysis.get("driver", {})
     device_name = analysis.get("device_name", "device")
+    budget = _estimate_question_budget(analysis)
 
     regs = derived.get("candidate_registers", [])
     irq_regs = derived.get("likely_irq_regs", [])
@@ -249,42 +372,46 @@ def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Pat
         "object",
         [f'{{"{irq_regs[0] if irq_regs else "INT_STATUS"}": {{"semantic": "W1C", "bits": ["DONE", "ERR"]}}}}'],
     )
-    add(
-        "Which registers/bits have read side effects (read-clear, FIFO pop, latch snapshot, etc.)?",
-        "Read side effects directly affect polling loops, data path behavior, and interrupt deassert timing.",
-        "object",
-        ['{"STATUS": ["DONE(read-clear)"], "RX_FIFO": "read pops one entry"}'],
-    )
-    add(
-        "Which writes trigger actions (START/CMD/DOORBELL/RESET) instead of only storing a value?",
-        "MVP code should implement a minimal working state machine from real driver access sequences.",
-        "object",
-        ['{"CTRL.START=1": "set BUSY, schedule completion", "CMD": "execute immediately"}'],
-    )
-    add(
-        "What is the BUSY/READY/DONE timing model after command start? Include delays/poll-count limits if known.",
-        "Drivers often rely on exact status transitions in polling loops and timeout paths.",
-        "object",
-        ['{"BUSY": "set on START, clear after <=100 polls", "DONE": "set when BUSY clears"}'],
-    )
-    add(
-        "What are IRQ set/clear conditions? Please distinguish raw status, mask/enable, masked status, and line update logic.",
-        "QEMU must implement correct qemu_set_irq behavior and status/mask interaction.",
-        "object",
-        ['{"set": ["RX_READY", "DMA_DONE"], "clear": ["W1C INT_STATUS"], "line_assert": "raw&mask != 0"}'],
-    )
-    add(
-        "What polling timeout behavior does the driver expect (delay function, timeout units, error code)?",
-        "This guides the minimum state transition timing needed to avoid spurious timeouts in the guest.",
-        "object",
-        ['{"delay_us": 10, "timeout_us": 10000, "error": "-ETIMEDOUT"}'],
-    )
-    add(
-        "What is the FIFO model (depth, thresholds, empty/full flags, overrun/underrun behavior)?",
-        "FIFO depth and side effects frequently control both data flow and IRQ behavior.",
-        "object",
-        ['{"tx_depth": 16, "rx_depth": 16, "rx_irq_threshold": 1, "overrun_sets": "ERR"}'],
-    )
+    if derived.get("driver_mmio_access_count", 0) > 0:
+        add(
+            "Which registers/bits have read side effects (read-clear, FIFO pop, latch snapshot, etc.)?",
+            "Read side effects directly affect polling loops, data path behavior, and interrupt deassert timing.",
+            "object",
+            ['{"STATUS": ["DONE(read-clear)"], "RX_FIFO": "read pops one entry"}'],
+        )
+        add(
+            "Which writes trigger actions (START/CMD/DOORBELL/RESET) instead of only storing a value?",
+            "MVP code should implement a minimal working state machine from real driver access sequences.",
+            "object",
+            ['{"CTRL.START=1": "set BUSY, schedule completion", "CMD": "execute immediately"}'],
+        )
+    if derived.get("driver_polling_pattern_count", 0) > 0:
+        add(
+            "What is the BUSY/READY/DONE timing model after command start? Include delays/poll-count limits if known.",
+            "Drivers often rely on exact status transitions in polling loops and timeout paths.",
+            "object",
+            ['{"BUSY": "set on START, clear after <=100 polls", "DONE": "set when BUSY clears"}'],
+        )
+        add(
+            "What polling timeout behavior does the driver expect (delay function, timeout units, error code)?",
+            "This guides the minimum state transition timing needed to avoid spurious timeouts in the guest.",
+            "object",
+            ['{"delay_us": 10, "timeout_us": 10000, "error": "-ETIMEDOUT"}'],
+        )
+    if irq_regs or driver.get("irq_clues"):
+        add(
+            "What are IRQ set/clear conditions? Please distinguish raw status, mask/enable, masked status, and line update logic.",
+            "QEMU must implement correct qemu_set_irq behavior and status/mask interaction.",
+            "object",
+            ['{"set": ["RX_READY", "DMA_DONE"], "clear": ["W1C INT_STATUS"], "line_assert": "raw&mask != 0"}'],
+        )
+    if fifo_regs:
+        add(
+            "What is the FIFO model (depth, thresholds, empty/full flags, overrun/underrun behavior)?",
+            "FIFO depth and side effects frequently control both data flow and IRQ behavior.",
+            "object",
+            ['{"tx_depth": 16, "rx_depth": 16, "rx_irq_threshold": 1, "overrun_sets": "ERR"}'],
+        )
 
     if dma_regs or driver.get("dma_clues"):
         add(
@@ -347,7 +474,8 @@ def generate_questions_from_analysis(analysis: dict[str, Any], project_root: Pat
         "version": "mvp-2",
         "generated_at": utc_now_iso(),
         "source": "heuristic-analysis",
-        "questions": deduped[:20],
+        "question_budget": budget,
+        "questions": deduped[: budget["max"]],
     }
 
     json_dump(project_root / "artifacts" / "questions.json", result)

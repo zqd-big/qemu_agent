@@ -139,6 +139,7 @@ def build_chat_payload(
     temperature: float = 0.1,
     max_tokens: int | None = None,
     stream: bool = True,
+    response_format: str | None = None,
 ) -> dict[str, Any]:
     resolved_max_tokens = _resolve_max_tokens(target.transformer_use, max_tokens)
     if target.protocol == "ollama":
@@ -152,6 +153,8 @@ def build_chat_payload(
         }
         if resolved_max_tokens is not None:
             payload["options"]["num_predict"] = resolved_max_tokens
+        if response_format in {"json", "json_object"}:
+            payload["format"] = "json"
         return payload
 
     payload: dict[str, Any] = {
@@ -162,6 +165,8 @@ def build_chat_payload(
     }
     if resolved_max_tokens is not None:
         payload["max_tokens"] = resolved_max_tokens
+    if response_format in {"json", "json_object"}:
+        payload["response_format"] = {"type": "json_object"}
     return payload
 
 
@@ -185,6 +190,7 @@ async def stream_chat_completion(
     *,
     temperature: float = 0.1,
     max_tokens: int | None = None,
+    response_format: str | None = None,
 ) -> AsyncIterator[str]:
     if target.protocol == "ollama":
         async for chunk in _stream_ollama_chat_completion(
@@ -192,6 +198,7 @@ async def stream_chat_completion(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            response_format=response_format,
         ):
             yield chunk
         return
@@ -202,6 +209,7 @@ async def stream_chat_completion(
         temperature=temperature,
         max_tokens=max_tokens,
         stream=True,
+        response_format=response_format,
     )
     headers = {"Content-Type": "application/json"}
     if target.api_key:
@@ -292,6 +300,7 @@ async def _stream_ollama_chat_completion(
     *,
     temperature: float = 0.1,
     max_tokens: int | None = None,
+    response_format: str | None = None,
 ) -> AsyncIterator[str]:
     payload = build_chat_payload(
         target,
@@ -299,6 +308,7 @@ async def _stream_ollama_chat_completion(
         temperature=temperature,
         max_tokens=max_tokens,
         stream=True,
+        response_format=response_format,
     )
     headers = {"Content-Type": "application/json"}
     if target.api_key:
@@ -315,7 +325,20 @@ async def _stream_ollama_chat_completion(
             ) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
-                    snippet = body.decode("utf-8", errors="replace")[:500]
+                    snippet = body.decode("utf-8", errors="replace")[:1000]
+                    try:
+                        err_obj = json.loads(snippet)
+                    except json.JSONDecodeError:
+                        err_obj = {}
+
+                    if resp.status_code == 401 and (
+                        "signin_url" in err_obj or target.model_name.endswith(":cloud")
+                    ):
+                        raise LLMRequestError(
+                            "Ollama unauthorized for cloud model. "
+                            f"Current model is '{target.model_name}'. "
+                            "Use a local model tag (without ':cloud'), or run `ollama signin` to use cloud models."
+                        )
                     raise LLMRequestError(f"Ollama HTTP {resp.status_code}: {snippet}")
 
                 async for line in resp.aiter_lines():

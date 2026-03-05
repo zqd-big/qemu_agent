@@ -276,3 +276,12 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - 目前上传仅支持 `.zip`
 - 分析和问题生成为规则/正则驱动的轻量实现（便于离线快速运行）
 - QEMU 代码生成依赖你提供的澄清答案质量；未确定语义会在代码中用 `TODO` 标注
+
+## Analyse Progress And Adaptive Questions
+
+- Added POST /projects/{id}/analyse_stream (NDJSON stream) for stage progress updates.
+- Frontend now shows a progress bar and stage messages during Analyse.
+- Question generation is no longer fixed-size:
+  - A dynamic question_budget is derived from analysis complexity.
+  - Typical range is 6-18 questions depending on available evidence.
+- Questions now include evidence_refs so each question can be traced back to extracted code evidence.

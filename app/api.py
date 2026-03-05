@@ -231,6 +231,7 @@ async def analyse_project(
             "questions_source": questions.get("source", "unknown"),
             "questions_model": (questions.get("llm") or {}).get("model"),
             "questions_fallback_reason": questions.get("fallback_reason"),
+            "question_budget_target": (questions.get("question_budget") or {}).get("target"),
         }
         return AnalysisResponse(
             project_id=project_id,
@@ -244,6 +245,95 @@ async def analyse_project(
     except Exception as exc:
         db.update_project_status(project_id, "analyse_failed")
         raise HTTPException(status_code=500, detail=f"Analyse failed: {exc}") from exc
+
+
+@router.post("/projects/{project_id}/analyse_stream")
+async def analyse_project_stream(
+    project_id: str,
+    req: AnalyseRequest | None = Body(default=None),
+) -> StreamingResponse:
+    meta = _project_meta_or_404(project_id)
+    root = _project_root(project_id)
+    request = req or AnalyseRequest()
+    if _count_real_files(root / "uploads" / "driver") == 0:
+        raise HTTPException(status_code=400, detail="Driver upload is empty. Upload driver archive first.")
+    if _count_real_files(root / "uploads" / "reference") == 0:
+        raise HTTPException(status_code=400, detail="Reference QEMU upload is empty. Upload reference archive first.")
+
+    async def event_stream() -> AsyncIterator[bytes]:
+        db.update_project_status(project_id, "analysing")
+        try:
+            yield _ndjson_event("status", stage="prepare", progress=5, message="Validating project inputs")
+
+            yield _ndjson_event("status", stage="ingest", progress=15, message="Scanning files and building chunks/index")
+            ingest_out = run_ingest(root)
+            yield _ndjson_event(
+                "status",
+                stage="ingest",
+                progress=38,
+                message="Ingest completed",
+                files=ingest_out["ingest"]["file_count"],
+                chunks=ingest_out["ingest"]["chunks_count"],
+            )
+
+            yield _ndjson_event("status", stage="analysis", progress=45, message="Extracting register/mmio/irq/fifo/dma evidence")
+            analysis = run_analysis(root, meta["device_name"], meta["device_type"])
+            yield _ndjson_event(
+                "status",
+                stage="analysis",
+                progress=65,
+                message="Analysis completed",
+                candidate_registers=len(analysis.get("derived", {}).get("candidate_registers", [])),
+                mmio_accesses=analysis.get("derived", {}).get("driver_mmio_access_count", 0),
+            )
+
+            yield _ndjson_event("status", stage="questions", progress=72, message="LLM is reasoning over analysis evidence")
+            questions = await generate_questions(
+                analysis,
+                root,
+                llm_config_path=request.llm_config_path,
+                use_llm=request.use_llm_questions,
+                allow_heuristic_fallback=request.allow_heuristic_fallback,
+                top_k=request.question_top_k,
+                temperature=request.question_temperature,
+                max_tokens=request.question_max_tokens,
+            )
+            yield _ndjson_event(
+                "status",
+                stage="questions",
+                progress=92,
+                message="Questions generated",
+                source=questions.get("source"),
+                question_count=len(questions.get("questions", [])),
+            )
+
+            db.update_project_status(project_id, "questions_ready")
+            summary = {
+                "files": ingest_out["ingest"]["file_count"],
+                "chunks": ingest_out["ingest"]["chunks_count"],
+                "candidate_registers": len(analysis.get("derived", {}).get("candidate_registers", [])),
+                "questions": len(questions.get("questions", [])),
+                "questions_source": questions.get("source", "unknown"),
+                "questions_model": (questions.get("llm") or {}).get("model"),
+                "questions_fallback_reason": questions.get("fallback_reason"),
+                "question_budget_target": (questions.get("question_budget") or {}).get("target"),
+            }
+            result = {
+                "project_id": project_id,
+                "analysis_artifact": "analysis.json",
+                "questions_artifact": "questions.json",
+                "summary": summary,
+            }
+            yield _ndjson_event("status", stage="done", progress=100, message="Analyse completed")
+            yield _ndjson_event("done", result=result)
+        except HTTPException as exc:
+            db.update_project_status(project_id, "analyse_failed")
+            yield _ndjson_event("error", message=str(exc.detail), status_code=exc.status_code)
+        except Exception as exc:
+            db.update_project_status(project_id, "analyse_failed")
+            yield _ndjson_event("error", message=f"Analyse failed: {exc}")
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @router.get("/projects/{project_id}/questions")
